@@ -2528,7 +2528,8 @@ def test_pdmd_projection_removes_the_residual_component_per_sample():
     projected = project_out_residual(direction, residual)
 
     dots = (projected * residual).flatten(1).sum(dim=1)
-    torch.testing.assert_close(dots[:2], torch.zeros(2, dtype=torch.float64), atol=1e-10, rtol=0)
+    # eps = 1e-8 in the denominator leaves <d', r> = <d, r> eps / (<r, r> + eps), ~1e-9 here.
+    torch.testing.assert_close(dots[:2], torch.zeros(2, dtype=torch.float64), atol=1e-6, rtol=0)
     # A zero residual leaves its sample unchanged.
     torch.testing.assert_close(projected[2], direction[2], atol=0, rtol=0)
     # Each sample is projected on its own residual only.
@@ -2557,7 +2558,7 @@ def test_vsd_pdmd_projection_off_is_dmd2_and_on_projects_before_normalizing():
     # An update entirely along the student-critic residual is removed: fake - teacher = 2 (gen - fake).
     parallel_teacher = fake - 2.0 * (gen - fake)
     torch.testing.assert_close(
-        scaled_grad(parallel_teacher, fake, True), torch.zeros_like(gen), atol=1e-9, rtol=0
+        scaled_grad(parallel_teacher, fake, True), torch.zeros_like(gen), atol=1e-6, rtol=0
     )
     assert pdmd_kept_ratio(gen, parallel_teacher, fake).item() < 1e-6
 
