@@ -14,6 +14,8 @@ from fastgen.methods.common_loss import (
     gan_loss_discriminator,
     gan_loss_generator,
     mse_loss,
+    pdmd_kept_ratio,
+    project_out_residual,
     transition_score_loss,
     transition_score_weight,
     variational_score_distillation_loss,
@@ -2515,3 +2517,54 @@ def test_noising_windows_condition_the_sampling_distribution(in_bucket, max_t):
         assert ((t >= start) & (t <= end)).all()
         lower_half = (t < (start + end) / 2).double().mean().item()
         assert abs(lower_half - 1 / (1 + window_shift)) < 0.01, step
+
+
+def test_pdmd_projection_removes_the_residual_component_per_sample():
+    torch.manual_seed(0)
+    direction = torch.randn(3, 4, 5, dtype=torch.float64)
+    residual = torch.randn(3, 4, 5, dtype=torch.float64)
+    residual[2] = 0.0
+
+    projected = project_out_residual(direction, residual)
+
+    dots = (projected * residual).flatten(1).sum(dim=1)
+    torch.testing.assert_close(dots[:2], torch.zeros(2, dtype=torch.float64), atol=1e-10, rtol=0)
+    # A zero residual leaves its sample unchanged.
+    torch.testing.assert_close(projected[2], direction[2], atol=0, rtol=0)
+    # Each sample is projected on its own residual only.
+    for i in range(3):
+        torch.testing.assert_close(projected[i : i + 1], project_out_residual(direction[i : i + 1], residual[i : i + 1]))
+
+
+def test_vsd_pdmd_projection_off_is_dmd2_and_on_projects_before_normalizing():
+    torch.manual_seed(0)
+    gen = torch.randn(2, 3, 4, dtype=torch.float64)
+    teacher = torch.randn_like(gen)
+    fake = torch.randn_like(gen)
+
+    def scaled_grad(teacher_x0, fake_x0, pdmd):
+        g = gen.clone().requires_grad_()
+        variational_score_distillation_loss(g, teacher_x0, fake_x0, pdmd_projection=pdmd).backward()
+        # 0.5 * mean((g - (g - vsd_grad))^2) has gradient vsd_grad / numel.
+        return g.grad * g.numel()
+
+    normalization = 1 / ((gen - teacher).abs().mean(dim=(1, 2), keepdim=True) + 1e-6)
+    torch.testing.assert_close(scaled_grad(teacher, fake, False), (fake - teacher) * normalization)
+    projected = project_out_residual(fake - teacher, gen - fake) * normalization
+    torch.testing.assert_close(scaled_grad(teacher, fake, True), projected)
+    assert 0.0 < pdmd_kept_ratio(gen, teacher, fake).item() < 1.0
+
+    # An update entirely along the student-critic residual is removed: fake - teacher = 2 (gen - fake).
+    parallel_teacher = fake - 2.0 * (gen - fake)
+    torch.testing.assert_close(
+        scaled_grad(parallel_teacher, fake, True), torch.zeros_like(gen), atol=1e-9, rtol=0
+    )
+    assert pdmd_kept_ratio(gen, parallel_teacher, fake).item() < 1e-6
+
+
+def test_pdmd_projection_requires_vsd():
+    config = ModelConfig()
+    config.pdmd_projection = True
+    config.vsd_loss_weight = 0.0
+    with pytest.raises(ValueError, match="requires vsd_loss_weight"):
+        DMD2Model(config)

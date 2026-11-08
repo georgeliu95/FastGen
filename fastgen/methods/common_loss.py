@@ -187,12 +187,38 @@ def transition_score_loss(
     return mean_with_loss_scale(elementwise_loss, loss_scale)
 
 
+def project_out_residual(direction: torch.Tensor, residual: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Remove from ``direction`` its component parallel to ``residual``, per sample (PDMD, arXiv:2609.35768, Eq. 4).
+
+    Returns ``d - <d, r> / (<r, r> + eps) * r`` with inner products over all non-batch dimensions, so every sample is
+    projected on its own residual. ``eps`` only matters when a residual is numerically zero; that sample's direction
+    is then left unchanged.
+    """
+    assert_same(shape=True, device=True, direction=direction, residual=residual)
+    dims = tuple(range(1, direction.ndim))
+    rr = residual.square().sum(dim=dims, keepdim=True)
+    dr = (direction * residual).sum(dim=dims, keepdim=True)
+    return direction - dr / (rr + eps) * residual
+
+
+def pdmd_kept_ratio(
+    gen_x0: torch.Tensor, teacher_x0: torch.Tensor, fake_score_x0: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """Batch mean of ``||d_projected|| / ||d||`` for the PDMD update (a logging diagnostic; 1 means nothing removed)."""
+    gen_x0, teacher_x0, fake_score_x0 = to_high_precision(gen_x0, teacher_x0, fake_score_x0)
+    direction = fake_score_x0 - teacher_x0
+    projected = project_out_residual(direction, gen_x0 - fake_score_x0, eps)
+    norm = torch.linalg.vector_norm(direction.flatten(1), dim=1)
+    return (torch.linalg.vector_norm(projected.flatten(1), dim=1) / norm.clamp_min(eps)).mean()
+
+
 def variational_score_distillation_loss(
     gen_data: torch.Tensor,
     teacher_x0: torch.Tensor,
     fake_score_x0: torch.Tensor,
     loss_scale: Optional[torch.Tensor] = None,
     gen_x0: Optional[torch.Tensor] = None,
+    pdmd_projection: bool = False,
 ) -> torch.Tensor:
     """
     Compute the variational score distillation loss.
@@ -205,6 +231,10 @@ def variational_score_distillation_loss(
             construction.
         gen_x0 (Optional[torch.Tensor]): Clean estimate of the generated data, whose
             residual against ``teacher_x0`` normalizes the gradient. Defaults to ``gen_data``.
+        pdmd_projection (bool): PDMD (arXiv:2609.35768). Before normalizing, drop the component of the update
+            direction ``fake_score_x0 - teacher_x0`` parallel to the student-critic residual
+            ``gen_x0 - fake_score_x0``, an unbiased estimate of the fake score's endpoint error, per sample. The
+            normalizer is unchanged. False keeps the DMD2 update unchanged.
 
     Returns:
         loss (torch.Tensor): The variational score distillation loss.
@@ -225,7 +255,10 @@ def variational_score_distillation_loss(
     with torch.no_grad():
         diff_abs_mean = (gen_x0 - teacher_x0).abs().mean(dim=dims, keepdim=True)
         normalization = 1 / (diff_abs_mean + 1e-6)
-        vsd_grad = (fake_score_x0 - teacher_x0) * normalization
+        direction = fake_score_x0 - teacher_x0
+        if pdmd_projection:
+            direction = project_out_residual(direction, gen_x0 - fake_score_x0)
+        vsd_grad = direction * normalization
         pseudo_target = gen_data - vsd_grad
 
     loss = 0.5 * mse_loss(gen_data, pseudo_target, loss_scale)

@@ -63,6 +63,12 @@ class ModelConfig(BaseModelConfig):
     # complete VSD/fake-score path, including its model and optimizer.
     vsd_loss_weight: float = 1.0
 
+    # PDMD (Projected Distribution Matching Distillation, arXiv:2609.35768): per sample and modality, drop the
+    # component of the VSD update parallel to the student-critic endpoint residual (gen x0 - fake-score x0), an
+    # unbiased estimate of the fake score's error, before the usual normalization. Requires VSD. False keeps the
+    # DMD2 update unchanged.
+    pdmd_projection: bool = False
+
     # weight for the GAN loss in the student update phase
     gan_loss_weight_gen: float = 0.001
 

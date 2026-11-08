@@ -53,6 +53,7 @@ from fastgen.methods.common_loss import (
     gan_loss_approx_r1,
     gan_loss_discriminator,
     gan_loss_generator,
+    pdmd_kept_ratio,
     transition_score_loss,
     variational_score_distillation_loss,
 )
@@ -128,6 +129,14 @@ class DMD2Model(FastGenModel):
                 f"{type(self).__name__} supports student_generation in {self.student_generations}, "
                 f"got {config.student_generation!r}."
             )
+        if getattr(config, "pdmd_projection", False):
+            if config.vsd_loss_weight <= 0:
+                raise ValueError("pdmd_projection projects the VSD update; it requires vsd_loss_weight > 0.")
+            if type(self)._compute_distribution_matching_loss is not DMD2Model._compute_distribution_matching_loss:
+                raise ValueError(
+                    f"pdmd_projection is implemented for DMD2's VSD objective; {type(self).__name__} overrides "
+                    "_compute_distribution_matching_loss."
+                )
         super().__init__(config)
 
     @property
@@ -500,8 +509,10 @@ class DMD2Model(FastGenModel):
     ) -> tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """Compute the VSD objective on ``gen_data``, the generation on its x0 scale (see ``_vsd_input``), normalized
         by the teacher residual of the clean estimate ``gen_x0`` (by default the generation itself), and its
-        logging entries."""
+        logging entries. With ``pdmd_projection`` the update is projected as in PDMD, and the per-modality
+        ``pdmd_kept_ratio`` (||projected update|| / ||update||) is logged."""
         del fake_logits, t
+        pdmd = bool(getattr(self.config, "pdmd_projection", False))
         vsd_per_modality = per_modality(
             variational_score_distillation_loss,
             gen_data,
@@ -509,9 +520,17 @@ class DMD2Model(FastGenModel):
             fake_score_x0,
             loss_scale=loss_scale,
             gen_x0=gen_x0,
+            pdmd_projection=pdmd,
         )
         loss_map = to_dict(vsd_per_modality, suffix="vsd_loss")
-        return loss_map, sum(loss_map.values())
+        total = sum(loss_map.values())
+        if pdmd:
+            with torch.no_grad():
+                kept = per_modality(
+                    pdmd_kept_ratio, gen_data if gen_x0 is None else gen_x0, teacher_x0, fake_score_x0
+                )
+            loss_map.update(to_dict(kept, suffix="pdmd_kept_ratio"))
+        return loss_map, total
 
     def _student_update_step(
         self,
