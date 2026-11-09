@@ -15,7 +15,7 @@ from fastgen.methods.common_loss import (
     gan_loss_generator,
     mse_loss,
     pdmd_kept_ratio,
-    project_out_residual,
+    project_update,
     transition_score_loss,
     transition_score_weight,
     variational_score_distillation_loss,
@@ -2525,7 +2525,7 @@ def test_pdmd_projection_removes_the_residual_component_per_sample():
     residual = torch.randn(3, 4, 5, dtype=torch.float64)
     residual[2] = 0.0
 
-    projected = project_out_residual(direction, residual)
+    projected = project_update(direction, residual)
 
     dots = (projected * residual).flatten(1).sum(dim=1)
     # eps = 1e-8 in the denominator leaves <d', r> = <d, r> eps / (<r, r> + eps), ~1e-9 here.
@@ -2534,7 +2534,7 @@ def test_pdmd_projection_removes_the_residual_component_per_sample():
     torch.testing.assert_close(projected[2], direction[2], atol=0, rtol=0)
     # Each sample is projected on its own residual only.
     for i in range(3):
-        torch.testing.assert_close(projected[i : i + 1], project_out_residual(direction[i : i + 1], residual[i : i + 1]))
+        torch.testing.assert_close(projected[i : i + 1], project_update(direction[i : i + 1], residual[i : i + 1]))
 
 
 def test_vsd_pdmd_projection_off_is_dmd2_and_on_projects_before_normalizing():
@@ -2551,7 +2551,7 @@ def test_vsd_pdmd_projection_off_is_dmd2_and_on_projects_before_normalizing():
 
     normalization = 1 / ((gen - teacher).abs().mean(dim=(1, 2), keepdim=True) + 1e-6)
     torch.testing.assert_close(scaled_grad(teacher, fake, False), (fake - teacher) * normalization)
-    projected = project_out_residual(fake - teacher, gen - fake) * normalization
+    projected = project_update(fake - teacher, gen - fake) * normalization
     torch.testing.assert_close(scaled_grad(teacher, fake, True), projected)
     assert 0.0 < pdmd_kept_ratio(gen, teacher, fake).item() < 1.0
 
@@ -2569,3 +2569,33 @@ def test_pdmd_projection_requires_vsd():
     config.vsd_loss_weight = 0.0
     with pytest.raises(ValueError, match="requires vsd_loss_weight"):
         DMD2Model(config)
+
+
+def _reference_pdmd_endpoint_update(student, teacher_endpoint, critic_endpoint, normalizer_floor=1e-5, eps=1e-8):
+    """``endpoint_update(projected=True)`` of the PDMD reference implementation, ported verbatim in math
+    (github.com/ZeamoxWang/pdmd, src/pdmd/objectives.py at 6b6e106)."""
+    p_real = student - teacher_endpoint
+    p_fake = student - critic_endpoint
+    direction = p_real - p_fake
+    dims = tuple(range(1, student.ndim))
+    rr = p_fake.square().sum(dims, keepdim=True)
+    dr = (direction * p_fake).sum(dims, keepdim=True)
+    direction = direction - dr / (rr + eps) * p_fake
+    normalizer = p_real.abs().mean(dims, keepdim=True).clamp_min(normalizer_floor)
+    return direction / normalizer
+
+
+def test_vsd_pdmd_matches_the_reference_endpoint_update():
+    torch.manual_seed(1)
+    gen = torch.randn(3, 2, 4, 5, dtype=torch.float64)
+    teacher = gen + 0.3 * torch.randn_like(gen)
+    fake = gen + 0.3 * torch.randn_like(gen)
+
+    g = gen.clone().requires_grad_()
+    variational_score_distillation_loss(g, teacher, fake, pdmd_projection=True).backward()
+    # The surrogate's pseudo-target is gen - update, so numel * grad is the update itself.
+    ours = g.grad * g.numel()
+
+    reference = _reference_pdmd_endpoint_update(gen, teacher, fake)
+    # Only the DMD2 normalizer's epsilon differs: 1 / (m + 1e-6) here, 1 / max(m, 1e-5) in the reference.
+    torch.testing.assert_close(ours, reference, rtol=1e-5, atol=1e-8)
